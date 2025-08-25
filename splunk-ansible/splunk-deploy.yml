@@ -1,0 +1,178 @@
+---
+- name: Splunk Enterprise (free trial) deploy on Ubuntu 22.04
+  hosts: splunk
+  become: true
+  gather_facts: true
+
+  vars:
+    splunk_version: "9.4.3"
+    splunk_build: "237ebbd22314"
+    splunk_deb: "splunk-{{ splunk_version }}-{{ splunk_build }}-linux-amd64.deb"
+    splunk_url: "https://download.splunk.com/products/splunk/releases/{{ splunk_version }}/linux/{{ splunk_deb }}"
+    dl_dir: "/tmp/splunk"
+    dl_path: "{{ dl_dir }}/{{ splunk_deb }}"
+    admin_user: "admin"
+    admin_pass: "ChangeMe!123"      # change after first login
+
+  tasks:
+    - name: Confirm Ubuntu 22.04
+      assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version is version('22.04', '==')
+
+    - name: Apt update + prereqs
+      apt:
+        update_cache: yes
+        name: [wget, ca-certificates]
+        state: present
+
+    - name: Create download dir
+      file:
+        path: "{{ dl_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download Splunk .deb (idempotent)
+      get_url:
+        url: "{{ splunk_url }}"
+        dest: "{{ dl_path }}"
+        mode: "0644"
+        force: no
+
+    - name: Ensure 'splunk' system user
+      user:
+        name: splunk
+        system: yes
+        shell: /usr/sbin/nologin
+        create_home: no
+
+    - name: Install Splunk package (handles deps)
+      apt:
+        deb: "{{ dl_path }}"
+
+    - name: Ensure /opt/splunk exists
+      stat:
+        path: /opt/splunk
+      register: splunk_opt
+
+    - name: Fail if /opt/splunk missing
+      fail:
+        msg: "/opt/splunk not found after install."
+      when: not splunk_opt.stat.exists
+
+    - name: Own /opt/splunk by splunk user
+      file:
+        path: /opt/splunk
+        state: directory
+        owner: splunk
+        group: splunk
+        recurse: yes
+
+    - name: Seed admin credentials (non-interactive first start)
+      copy:
+        dest: /opt/splunk/etc/system/local/user-seed.conf
+        owner: splunk
+        group: splunk
+        mode: "0600"
+        content: |
+          [user_info]
+          USERNAME = {{ admin_user }}
+          PASSWORD = {{ admin_pass }}
+
+    - name: Ensure local config dir
+      file:
+        path: /opt/splunk/etc/system/local
+        state: directory
+        owner: splunk
+        group: splunk
+        mode: "0755"
+
+    - name: Ensure web server is enabled (minimal web.conf)
+      copy:
+        dest: /opt/splunk/etc/system/local/web.conf
+        owner: splunk
+        group: splunk
+        mode: "0644"
+        content: |
+          [settings]
+          httpport = 8000
+          startwebserver = 1
+
+    - name: Enable boot-start (creates systemd unit)
+      command: >
+        /opt/splunk/bin/splunk enable boot-start
+        -user splunk
+        --accept-license --answer-yes --no-prompt
+      args:
+        creates: /etc/systemd/system/Splunk.service
+
+    - name: systemd daemon-reload
+      systemd:
+        daemon_reload: yes
+
+    - name: Start and enable Splunk
+      systemd:
+        name: Splunk
+        state: started
+        enabled: yes
+
+    - name: Restart Splunk to apply configs
+      systemd:
+        name: Splunk
+        state: restarted
+
+    - name: Wait for Splunk Web on 127.0.0.1:8000 (first boot can be slow)
+      wait_for:
+        host: 127.0.0.1
+        port: 8000
+        timeout: 300
+
+    # Diagnostics only if something blocks 8000
+    - block:
+        - name: Sanity check HTTP
+          uri:
+            url: http://127.0.0.1:8000
+            return_content: no
+            status_code: 200,302
+      rescue:
+        - name: Listeners on 8000
+          shell: "ss -lntp | grep ':8000' || true"
+          register: port_scan
+          changed_when: false
+        - name: Tail web_service.log
+          shell: "tail -n 120 /opt/splunk/var/log/splunk/web_service.log || true"
+          register: web_log
+          changed_when: false
+        - name: Tail splunkd.log
+          shell: "tail -n 120 /opt/splunk/var/log/splunk/splunkd.log || true"
+          register: splunkd_log
+          changed_when: false
+        - name: Stop with diagnostics
+          fail:
+            msg: |
+              Web not ready.
+              Listeners: {{ port_scan.stdout | default('none') }}
+
+              web_service.log:
+              {{ web_log.stdout | default('n/a') }}
+
+              splunkd.log:
+              {{ splunkd_log.stdout | default('n/a') }}
+
+    - name: Fetch EC2 public IPv4 (if available)
+      uri:
+        url: "http://169.254.169.254/latest/meta-data/public-ipv4"
+        return_content: yes
+        status_code: 200
+      register: ec2_pub_ip
+      failed_when: false
+      changed_when: false
+
+    - name: Access info
+      debug:
+        msg:
+          - "Splunk is installed in /opt/splunk and running."
+          - "Local URL:  http://127.0.0.1:8000"
+          - "Public URL: http://{{ ec2_pub_ip.content | default('YOUR-EC2-PUBLIC-IP') }}:8000"
+          - "Login: {{ admin_user }} / {{ admin_pass }} (change ASAP)"
